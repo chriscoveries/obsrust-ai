@@ -49,7 +49,7 @@ install: bundle
 
 # Headless check: dlopen the dylib and feed a WAV's PCM through it.
 test-host: build/test-host
-	DYLD_LIBRARY_PATH=. ./build/test-host ../obsrust/spikes/2026-10-12/speech-rollup/speech-30s.wav
+	DYLD_LIBRARY_PATH=. ./build/test-host ../spikes/2026-10-12/speech-rollup/speech-30s.wav
 
 build/test-host: test_host.c | build
 	xcrun clang -O2 -target arm64-apple-macos14.0 -o $@ $< -ldl

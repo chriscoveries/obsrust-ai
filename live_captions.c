@@ -58,6 +58,8 @@ struct lc_filter {
 	int nlines;
 	size_t col;
 	char volatile_line[512];
+	int mode; /* 0 = roll-up window, 1 = single word */
+	char single_word[128];
 };
 
 static void lc_queue_text_update(struct lc_filter *f);
@@ -136,6 +138,30 @@ static void lc_compose(struct lc_filter *f, char *out, size_t out_sz)
 	 * space-padded line keeps the box a constant 32 columns wide. */
 	(void)out_sz;
 	char *p = out;
+	if (f->mode == 1) {
+		/* single word: prefer the tail word of the volatile line while
+		 * recognition is in progress, else the last finalized word;
+		 * centered in the fixed 32-column box */
+		const char *w = f->single_word;
+		char vtail[COLS + 1];
+		if (f->show_progress) {
+			lc_tail32(f->volatile_line, vtail);
+			char *sp = strrchr(vtail, ' ');
+			const char *last = sp ? sp + 1 : vtail;
+			if (last[0])
+				w = last;
+		}
+		size_t n = strlen(w);
+		if (n > COLS)
+			w += n - COLS, n = COLS;
+		size_t lead = (COLS - n) / 2;
+		memset(p, ' ', lead);
+		memcpy(p + lead, w, n);
+		memset(p + lead + n, ' ', COLS - lead - n);
+		p += COLS;
+		*p = '\0';
+		return;
+	}
 	int first = f->nlines - (int)f->rows;
 	for (int i = first; i < f->nlines; i++) {
 		size_t n = strlen(f->lines[i]);
@@ -163,7 +189,12 @@ static void on_word(void *opaque, const char *word, double start, double end)
 	(void)end;
 	struct lc_filter *f = opaque;
 	pthread_mutex_lock(&f->mu);
-	lc_put_word(f, word);
+	if (f->mode == 1) {
+		strncpy(f->single_word, word, sizeof(f->single_word) - 1);
+		f->single_word[sizeof(f->single_word) - 1] = '\0';
+	} else {
+		lc_put_word(f, word);
+	}
 	pthread_mutex_unlock(&f->mu);
 	lc_queue_text_update(f);
 }
@@ -362,6 +393,9 @@ static void lc_update_(struct lc_filter *f, obs_data_t *settings)
 		obs_weak_source_release(f->target);
 	f->target = new_target;
 	pthread_mutex_unlock(&f->mu);
+	f->mode = (int)obs_data_get_int(settings, "display_mode");
+	if (f->mode != 0 && f->mode != 1)
+		f->mode = 0;
 	f->rows = (uint32_t)obs_data_get_int(settings, "rows");
 	if (f->rows != 2 && f->rows != 3)
 		f->rows = 2;
@@ -441,6 +475,11 @@ static obs_properties_t *lc_properties(void *data)
 	if (f && f->target_name[0])
 		obs_property_list_add_string(list, f->target_name, f->target_name);
 
+	obs_property_t *mode = obs_properties_add_list(
+		props, "display_mode", "Display", OBS_COMBO_TYPE_LIST,
+		OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(mode, "Roll-up window", 0);
+	obs_property_list_add_int(mode, "Single word", 1);
 	obs_property_t *rows = obs_properties_add_list(
 		props, "rows", "Rows", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(rows, "2", 2);

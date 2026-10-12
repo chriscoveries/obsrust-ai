@@ -81,7 +81,10 @@ func startSession(sampleRate: Double, emit: Session) async throws -> Int32 {
         compatibleWith: modules, considering: sourceFormat)
     else { return -5 }
     let converter = AnalyzerInputConverter(analyzerFormat: analyzerFormat)
-    let analyzer = SpeechAnalyzer(modules: modules)
+    let analyzer = SpeechAnalyzer(modules: modules, options:
+        SpeechAnalyzer.Options(priority: .high,
+                               modelRetention: .processLifetime,
+                               ignoresResourceLimits: true))
     try await analyzer.prepareToAnalyze(in: analyzerFormat)
     let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
     try await analyzer.start(inputSequence: stream)
