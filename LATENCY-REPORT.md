@@ -55,6 +55,38 @@ Keep `stt_live.swift` on SpeechTranscriber (already is). If not already set,
 add `SpeechAnalyzer.Options(priority: .high, modelRetention: .processLifetime,
 ignoresResourceLimits: true)` — measured, small but consistent win.
 
+## Per-word latency (2026-10-13, corrected methodology)
+
+`measure-pw.jsonl` — `opts` config re-run emitting per-word volatile events
+with audio ranges. Per-word delay = callback wall time minus the word's
+final audio END. Volatile updates emit overlapping run segmentations; the
+analysis reconstructs the finest contiguous chain per update, segments
+utterances at volatile-stream resets, and aligns by word index.
+
+| metric (n=42 words) | min | p50 | p90 | max |
+|---|---|---|---|---|
+| volatile-first appearance | -1.80 s* | **0.78 s** | 1.26 s | 1.61 s |
+| stable-commit (text stops changing) | -0.64 s* | **0.97 s** | 1.37 s | 1.61 s |
+| finalized | 0.76 s | 3.18 s | 6.02 s | 7.58 s |
+
+\* negative = volatile appeared before the word's *final* audio-end
+estimate; volatile runs carry unstable per-word ranges, so first-appearance
+can precede the (revised) end timestamp.
+
+Key corrections to the earlier table:
+
+- The earlier "final p50 2.85 s" conflated batch finalization:
+  SpeechTranscriber finalizes a whole utterance ~1.3 s after its last word
+  ends, so mid-phrase words wait out the rest of the phrase. That is NOT
+  the latency a live caption mode experiences.
+- Per-word, the live latency is **~0.8–1.3 s after each word's audio end**
+  for both volatile-first and stable-commit — consistent with the ~0.8 s
+  the owner observes in OBS. The wall/audio clock mapping (real-time-paced
+  feed, epoch = feed start) was not the problem.
+- Volatile text barely revises once a word is fully formed, so Fast
+  (stable-prefix) and Instant land nearly identical per-word latencies on
+  this clip; Instant's edge is showing words still being spelled out.
+
 ## Reproduce
 
 ```sh

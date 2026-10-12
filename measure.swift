@@ -19,7 +19,8 @@ func emit(_ o: [String: Any]) {
 nonisolated(unsafe) var epoch = ProcessInfo.processInfo.systemUptime
 func wall() -> Double { ProcessInfo.processInfo.systemUptime - epoch }
 
-func emitRuns(_ text: AttributedString, runs: AttributedString.Runs) {
+func emitRuns(_ text: AttributedString, runs: AttributedString.Runs,
+              ev: String = "w") {
     for run in runs {
         let t = String(text[run.range].characters)
         var s = 0.0, d = 0.0
@@ -30,7 +31,7 @@ func emitRuns(_ text: AttributedString, runs: AttributedString.Runs) {
         let ws = t.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         for (i, w) in ws.enumerated() where !w.isEmpty {
             let n = Double(ws.count)
-            emit(["ev": "w", "wall": wall(), "s": s + d * Double(i) / n,
+            emit(["ev": ev, "wall": wall(), "s": s + d * Double(i) / n,
                   "e": s + d * Double(i + 1) / n, "w": w])
         }
     }
@@ -98,17 +99,17 @@ func runConfig(name: String, wavPath: String) async throws {
             if let t = transcriber {
                 for try await r in t.results {
                     if !r.isFinal {
-                        emit(["ev": "v", "wall": wall(), "text": String(r.text.characters)])
+                        emitRuns(r.text, runs: r.text.runs, ev: "vw")
                     } else {
-                        emitRuns(r.text, runs: r.text.runs)
+                        emitRuns(r.text, runs: r.text.runs, ev: "w")
                     }
                 }
             } else if let t = dictation {
                 for try await r in t.results {
                     if !r.isFinal {
-                        emit(["ev": "v", "wall": wall(), "text": String(r.text.characters)])
+                        emitRuns(r.text, runs: r.text.runs, ev: "vw")
                     } else {
-                        emitRuns(r.text, runs: r.text.runs)
+                        emitRuns(r.text, runs: r.text.runs, ev: "w")
                     }
                 }
             }
