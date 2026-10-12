@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 
 #define COLS 32
@@ -32,6 +33,7 @@ struct lc_filter {
 	obs_weak_source_t *target;
 	uint32_t rows;
 	bool show_progress;
+	bool mono_style;
 
 	uint32_t rate; /* OBS mixer rate, frames/sec */
 	uint32_t channels;
@@ -98,20 +100,59 @@ static void lc_put_word(struct lc_filter *f, const char *w)
 	dst[f->col] = '\0';
 }
 
+/* Trim and take the last <= COLS characters, cut at a word boundary. */
+static void lc_tail32(const char *in, char *out)
+{
+	size_t len = strlen(in);
+	while (len && isspace((unsigned char)in[len - 1]))
+		len--;
+	size_t start = 0;
+	while (start < len && isspace((unsigned char)in[start]))
+		start++;
+	len -= start;
+	if (len > COLS) {
+		start += len - COLS;
+		len = COLS;
+		/* don't split a word mid-way: drop the partial leading word */
+		while (len > 0 && !isspace((unsigned char)in[start])) {
+			start++;
+			len--;
+		}
+		while (len && isspace((unsigned char)in[start])) {
+			start++;
+			len--;
+		}
+	}
+	memcpy(out, in + start, len);
+	out[len] = '\0';
+}
+
 static void lc_compose(struct lc_filter *f, char *out, size_t out_sz)
 {
-	size_t used = 0;
-	/* show only the bottom `rows` rows of the 3-row backing window */
+	/* Fixed grid: exactly `rows` caption lines plus (when enabled) one
+	 * in-progress line, every line padded to COLS with trailing spaces.
+	 * Trailing spaces DO count toward ft2 width (text-functionality.c
+	 * get_ft2_text_width sums slot->advance.x per glyph incl. spaces), so a
+	 * space-padded line keeps the box a constant 32 columns wide. */
+	(void)out_sz;
+	char *p = out;
 	int first = f->nlines - (int)f->rows;
 	for (int i = first; i < f->nlines; i++) {
-		int n = snprintf(out + used, out_sz - used, "%s%s",
-				 i || used ? "\n" : "", f->lines[i]);
-		if (n > 0)
-			used += (size_t)n < out_sz - used ? (size_t)n : out_sz - used - 1;
+		size_t n = strlen(f->lines[i]);
+		memcpy(p, f->lines[i], n);
+		memset(p + n, ' ', COLS - n);
+		p += COLS;
+		*p++ = '\n';
 	}
-	if (f->show_progress && f->volatile_line[0])
-		snprintf(out + used, out_sz - used, "%s%s",
-			 used ? "\n" : "", f->volatile_line);
+	if (f->show_progress) {
+		char tail[COLS + 1];
+		lc_tail32(f->volatile_line, tail);
+		size_t n = strlen(tail);
+		memcpy(p, tail, n);
+		memset(p + n, ' ', COLS - n);
+		p += COLS;
+	}
+	*p = '\0';
 }
 
 /* ---------------- callbacks from libstt_live (worker-side threads) -------- */
@@ -144,6 +185,7 @@ static void on_volatile(void *opaque, const char *text)
 struct text_job {
 	obs_weak_source_t *target;
 	char *text;
+	bool mono_style;
 };
 
 static void lc_apply_text(void *param)
@@ -151,8 +193,19 @@ static void lc_apply_text(void *param)
 	struct text_job *job = param;
 	obs_source_t *target = obs_weak_source_get_source(job->target);
 	if (target) {
-		obs_data_t *s = obs_data_create();
+		obs_data_t *s = obs_source_get_settings(target);
 		obs_data_set_string(s, "text", job->text);
+		if (job->mono_style) {
+			/* Menlo for a constant-width 32-column grid; keep the
+			 * source's own size/style, turn the outline on. */
+			obs_data_t *font = obs_data_get_obj(s, "font");
+			if (font) {
+				obs_data_set_string(font, "face", "Menlo");
+				obs_data_set_obj(s, "font", font);
+				obs_data_release(font);
+			}
+			obs_data_set_bool(s, "outline", true);
+		}
 		obs_source_update(target, s);
 		obs_data_release(s);
 		obs_source_release(target);
@@ -169,6 +222,7 @@ static void lc_queue_text_update(struct lc_filter *f)
 	lc_compose(f, buf, sizeof(buf));
 	char *copy = bstrdup(buf);
 	obs_weak_source_t *weak = f->target;
+	bool mono = f->mono_style;
 	if (weak)
 		obs_weak_source_addref(weak);
 	pthread_mutex_unlock(&f->mu);
@@ -177,6 +231,7 @@ static void lc_queue_text_update(struct lc_filter *f)
 		struct text_job *job = bmalloc(sizeof(*job));
 		job->target = weak;
 		job->text = copy;
+		job->mono_style = mono;
 		obs_queue_task(OBS_TASK_UI, lc_apply_text, job, false);
 	} else {
 		bfree(copy);
@@ -311,6 +366,7 @@ static void lc_update_(struct lc_filter *f, obs_data_t *settings)
 	if (f->rows != 2 && f->rows != 3)
 		f->rows = 2;
 	f->show_progress = obs_data_get_bool(settings, "show_in_progress");
+	f->mono_style = obs_data_get_bool(settings, "caption_style");
 }
 
 static void lc_update(void *data, obs_data_t *settings)
@@ -391,6 +447,8 @@ static obs_properties_t *lc_properties(void *data)
 	obs_property_list_add_int(rows, "3", 3);
 	obs_properties_add_bool(props, "show_in_progress",
 				"Show in-progress words");
+	obs_properties_add_bool(props, "caption_style",
+				"Caption style (monospace)");
 	return props;
 }
 
@@ -398,6 +456,7 @@ static void lc_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "rows", 2);
 	obs_data_set_default_bool(settings, "show_in_progress", true);
+	obs_data_set_default_bool(settings, "caption_style", true);
 }
 
 struct obs_source_info live_captions_filter = {
