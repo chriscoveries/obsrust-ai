@@ -32,6 +32,10 @@ bundle: libstt_live.dylib build/obs-live-captions
 	mkdir -p "$(BUNDLE)/Contents/MacOS" "$(BUNDLE)/Contents/Resources"
 	cp build/obs-live-captions "$(BUNDLE)/Contents/MacOS/obs-live-captions"
 	cp libstt_live.dylib "$(BUNDLE)/Contents/Resources/libstt_live.dylib"
+	# OBS loads the default locale from <data_path>/locale/en-US.ini, where
+	# data_path is the bundle's Contents/Resources (PluginModuleLoader_MacOS).
+	mkdir -p "$(BUNDLE)/Contents/Resources/locale"
+	cp data/locale/en-US.ini "$(BUNDLE)/Contents/Resources/locale/en-US.ini"
 	@printf '<?xml version="1.0" encoding="UTF-8"?>\n\
 	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n\
 	<plist version="1.0"><dict>\n\

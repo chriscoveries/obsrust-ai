@@ -438,7 +438,7 @@ static void *lc_worker(void *opaque)
 static const char *lc_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "Live Captions (Apple Speech)";
+	return obs_module_text("LiveCaptions");
 }
 
 static bool lc_start_engine(struct lc_filter *f)
@@ -622,33 +622,34 @@ static obs_properties_t *lc_properties(void *data)
 	struct lc_filter *f = data;
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *list = obs_properties_add_list(
-		props, "target_source", "Caption text source",
+		props, "target_source", obs_module_text("TargetSource"),
 		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_enum_sources(lc_enum_text_sources, list);
 	if (f && f->target_name[0])
 		obs_property_list_add_string(list, f->target_name, f->target_name);
 
 	obs_property_t *mode = obs_properties_add_list(
-		props, "display_mode", "Display", OBS_COMBO_TYPE_LIST,
-		OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(mode, "Roll-up window", 0);
-	obs_property_list_add_int(mode, "Single word", 1);
+		props, "display_mode", obs_module_text("Display"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(mode, obs_module_text("Display.Rollup"), 0);
+	obs_property_list_add_int(mode, obs_module_text("Display.SingleWord"), 1);
 	obs_property_t *lat = obs_properties_add_list(
-		props, "latency_mode", "Latency", OBS_COMBO_TYPE_LIST,
-		OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(lat, "Stable (finalized words)", 0);
-	obs_property_list_add_int(lat, "Fast (stable prefix)", 1);
-	obs_property_list_add_int(lat, "Instant (volatile)", 2);
-	obs_properties_add_int_slider(props, "hold_ms", "Hold (ms)", 0, 3000,
-				    50);
+		props, "latency_mode", obs_module_text("Latency"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(lat, obs_module_text("Latency.Stable"), 0);
+	obs_property_list_add_int(lat, obs_module_text("Latency.Fast"), 1);
+	obs_property_list_add_int(lat, obs_module_text("Latency.Instant"), 2);
+	obs_properties_add_int_slider(props, "hold_ms",
+				      obs_module_text("Hold"), 0, 3000, 50);
 	obs_property_t *rows = obs_properties_add_list(
-		props, "rows", "Rows", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+		props, "rows", obs_module_text("Rows"), OBS_COMBO_TYPE_LIST,
+		OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(rows, "2", 2);
 	obs_property_list_add_int(rows, "3", 3);
 	obs_properties_add_bool(props, "show_in_progress",
-				"Show in-progress words");
+				obs_module_text("ShowInProgress"));
 	obs_properties_add_bool(props, "caption_style",
-				"Caption style (monospace)");
+				obs_module_text("CaptionStyle"));
 	return props;
 }
 
