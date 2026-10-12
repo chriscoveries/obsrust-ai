@@ -24,6 +24,14 @@ Builds against the libobs fork build at `~/obsrust/obs-studio`
    **Live Captions (Apple Speech)**.
 4. In the filter properties:
    - **Caption text source**: pick the text source.
+   - **Display**: *Roll-up window* (2–3 scrolling lines) or *Single word*
+     (the current word, centred in a fixed 32-column box).
+   - **Latency**: *Stable* shows only finalized words; *Fast (stable
+     prefix)* — the default — shows a word as soon as the transcriber's
+     volatile text stops revising it; *Instant* shows volatile text
+     immediately (it may be revised).
+   - **Hold (ms)**: minimum time each committed word stays before the next
+     replaces it (default 250).
    - **Rows**: 2 or 3 (the roll-up window height).
    - **Show in-progress words**: on = the transcriber's volatile text shows
      as an extra line under the window until it finalizes.

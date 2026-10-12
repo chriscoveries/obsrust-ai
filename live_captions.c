@@ -60,6 +60,24 @@ struct lc_filter {
 	char volatile_line[512];
 	int mode; /* 0 = roll-up window, 1 = single word */
 	char single_word[128];
+
+	int latency_mode; /* 0 = stable (finals only), 1 = fast (stable
+			     prefix of volatile stream), 2 = instant */
+	int hold_ms;
+
+	/* hold queue: committed words spaced by hold_ms before display */
+	char hold_q[64][COLS + 1];
+	int hold_n;
+	int64_t shown_ms; /* mono ms when last word was applied, 0 = none */
+
+	/* speculative commits from the volatile stream awaiting final dedup */
+	char spec_q[64][COLS + 1];
+	int spec_n;
+	/* volatile stream tracking: previous update's words + count already
+	 * committed from the current utterance */
+	char prev_vol[64][COLS + 1];
+	int prev_vol_n;
+	int vol_committed;
 };
 
 static void lc_queue_text_update(struct lc_filter *f);
@@ -139,12 +157,12 @@ static void lc_compose(struct lc_filter *f, char *out, size_t out_sz)
 	(void)out_sz;
 	char *p = out;
 	if (f->mode == 1) {
-		/* single word: prefer the tail word of the volatile line while
-		 * recognition is in progress, else the last finalized word;
-		 * centered in the fixed 32-column box */
+		/* single word, centred in the fixed 32-column box. Instant
+		 * latency shows the volatile tail word; Stable/Fast show the
+		 * last committed word. */
 		const char *w = f->single_word;
 		char vtail[COLS + 1];
-		if (f->show_progress) {
+		if (f->latency_mode == 2) {
 			lc_tail32(f->volatile_line, vtail);
 			char *sp = strrchr(vtail, ' ');
 			const char *last = sp ? sp + 1 : vtail;
@@ -181,6 +199,79 @@ static void lc_compose(struct lc_filter *f, char *out, size_t out_sz)
 	*p = '\0';
 }
 
+/* ---------------- commit path: speculation, dedup, hold ---------------- */
+
+static int64_t lc_now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Apply a word to the display buffer. Call with f->mu held. */
+static void lc_apply_word(struct lc_filter *f, const char *w)
+{
+	if (f->mode == 1) {
+		strncpy(f->single_word, w, sizeof(f->single_word) - 1);
+		f->single_word[sizeof(f->single_word) - 1] = '\0';
+	} else {
+		lc_put_word(f, w);
+	}
+	f->shown_ms = lc_now_ms();
+}
+
+/* Commit a word for display, honouring the hold delay. Call with mu held.
+ * Returns true when the display changed (caller should post a UI update). */
+static bool lc_commit(struct lc_filter *f, const char *w, bool speculative)
+{
+	if (!w[0])
+		return false;
+	if (speculative && f->spec_n < 64)
+		strcpy(f->spec_q[f->spec_n++], w);
+	if (f->hold_ms > 0 && f->shown_ms > 0 &&
+	    lc_now_ms() - f->shown_ms < f->hold_ms && f->hold_n < 64) {
+		strcpy(f->hold_q[f->hold_n++], w);
+		return false;
+	}
+	lc_apply_word(f, w);
+	return true;
+}
+
+/* Pop due words from the hold queue. Call with mu held. */
+static bool lc_hold_tick(struct lc_filter *f)
+{
+	if (f->hold_n <= 0 || lc_now_ms() - f->shown_ms < f->hold_ms)
+		return false;
+	char w[COLS + 1];
+	strcpy(w, f->hold_q[0]);
+	memmove(f->hold_q[0], f->hold_q[1], (size_t)--f->hold_n * sizeof(f->hold_q[0]));
+	lc_apply_word(f, w);
+	return true;
+}
+
+/* Split text into words (bounded). Returns count. */
+static int lc_words(const char *text, char out[][COLS + 1], int max)
+{
+	int n = 0;
+	const char *p = text;
+	while (*p && n < max) {
+		while (isspace((unsigned char)*p))
+			p++;
+		const char *s = p;
+		while (*p && !isspace((unsigned char)*p))
+			p++;
+		size_t len = (size_t)(p - s);
+		if (len > COLS)
+			len = COLS;
+		if (len) {
+			memcpy(out[n], s, len);
+			out[n][len] = '\0';
+			n++;
+		}
+	}
+	return n;
+}
+
 /* ---------------- callbacks from libstt_live (worker-side threads) -------- */
 
 static void on_word(void *opaque, const char *word, double start, double end)
@@ -189,14 +280,23 @@ static void on_word(void *opaque, const char *word, double start, double end)
 	(void)end;
 	struct lc_filter *f = opaque;
 	pthread_mutex_lock(&f->mu);
-	if (f->mode == 1) {
-		strncpy(f->single_word, word, sizeof(f->single_word) - 1);
-		f->single_word[sizeof(f->single_word) - 1] = '\0';
+	bool dirty;
+	if (f->spec_n > 0) {
+		/* a speculative commit reached final: confirm and drop it */
+		bool match = strcmp(f->spec_q[0], word) == 0;
+		memmove(f->spec_q[0], f->spec_q[1],
+			(size_t)--f->spec_n * sizeof(f->spec_q[0]));
+		/* on mismatch the speculation was wrong: show the final */
+		dirty = !match && lc_commit(f, word, false);
 	} else {
-		lc_put_word(f, word);
+		dirty = lc_commit(f, word, false);
 	}
+	/* utterance boundary: the next volatile stream starts fresh */
+	f->prev_vol_n = 0;
+	f->vol_committed = 0;
 	pthread_mutex_unlock(&f->mu);
-	lc_queue_text_update(f);
+	if (dirty)
+		lc_queue_text_update(f);
 }
 
 static void on_volatile(void *opaque, const char *text)
@@ -205,9 +305,38 @@ static void on_volatile(void *opaque, const char *text)
 	pthread_mutex_lock(&f->mu);
 	strncpy(f->volatile_line, text, sizeof(f->volatile_line) - 1);
 	f->volatile_line[sizeof(f->volatile_line) - 1] = '\0';
-	bool changed = f->show_progress;
+
+	char wv[64][COLS + 1];
+	int n = lc_words(f->volatile_line, wv, 64);
+	int c = 0; /* common word prefix with the previous update */
+	while (c < n && c < f->prev_vol_n &&
+	       strcmp(wv[c], f->prev_vol[c]) == 0)
+		c++;
+
+	bool dirty = f->show_progress;
+	if (f->latency_mode == 2 && f->mode != 1) {
+		/* instant, roll-up: commit each word as it first appears */
+		for (int i = f->vol_committed; i < n; i++)
+			dirty |= lc_commit(f, wv[i], true);
+		f->vol_committed = n;
+	} else if (f->latency_mode == 1) {
+		/* fast: commit words once the volatile prefix is stable */
+		for (int i = f->vol_committed; i < c; i++)
+			dirty |= lc_commit(f, wv[i], true);
+		if (c < f->vol_committed)
+			f->vol_committed = c;
+	}
+	if (f->latency_mode == 2 && f->mode == 1)
+		dirty = true; /* compose shows the volatile tail */
+	if (c < f->vol_committed)
+		f->vol_committed = c;
+	if (f->latency_mode == 2)
+		f->vol_committed = n > f->vol_committed ? n : f->vol_committed;
+
+	memcpy(f->prev_vol, wv, sizeof(wv));
+	f->prev_vol_n = n;
 	pthread_mutex_unlock(&f->mu);
-	if (changed)
+	if (dirty)
 		lc_queue_text_update(f);
 }
 
@@ -280,6 +409,11 @@ static void *lc_worker(void *opaque)
 		size_t r = atomic_load_explicit(&f->ring_r, memory_order_acquire);
 		size_t w = atomic_load_explicit(&f->ring_w, memory_order_acquire);
 		size_t avail = w - r;
+		pthread_mutex_lock(&f->mu);
+		bool dirty = lc_hold_tick(f);
+		pthread_mutex_unlock(&f->mu);
+		if (dirty)
+			lc_queue_text_update(f);
 		if (avail == 0) {
 			usleep(5000);
 			continue;
@@ -393,9 +527,24 @@ static void lc_update_(struct lc_filter *f, obs_data_t *settings)
 		obs_weak_source_release(f->target);
 	f->target = new_target;
 	pthread_mutex_unlock(&f->mu);
-	f->mode = (int)obs_data_get_int(settings, "display_mode");
-	if (f->mode != 0 && f->mode != 1)
-		f->mode = 0;
+	int new_mode = (int)obs_data_get_int(settings, "display_mode");
+	if (new_mode != 0 && new_mode != 1)
+		new_mode = 0;
+	int new_latency = (int)obs_data_get_int(settings, "latency_mode");
+	if (new_latency < 0 || new_latency > 2)
+		new_latency = 1;
+	pthread_mutex_lock(&f->mu);
+	if (new_mode != f->mode || new_latency != f->latency_mode) {
+		/* reset pending speculation so a mode switch can't replay it */
+		f->hold_n = 0;
+		f->spec_n = 0;
+		f->prev_vol_n = 0;
+		f->vol_committed = 0;
+	}
+	f->mode = new_mode;
+	f->latency_mode = new_latency;
+	f->hold_ms = (int)obs_data_get_int(settings, "hold_ms");
+	pthread_mutex_unlock(&f->mu);
 	f->rows = (uint32_t)obs_data_get_int(settings, "rows");
 	if (f->rows != 2 && f->rows != 3)
 		f->rows = 2;
@@ -480,6 +629,14 @@ static obs_properties_t *lc_properties(void *data)
 		OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(mode, "Roll-up window", 0);
 	obs_property_list_add_int(mode, "Single word", 1);
+	obs_property_t *lat = obs_properties_add_list(
+		props, "latency_mode", "Latency", OBS_COMBO_TYPE_LIST,
+		OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(lat, "Stable (finalized words)", 0);
+	obs_property_list_add_int(lat, "Fast (stable prefix)", 1);
+	obs_property_list_add_int(lat, "Instant (volatile)", 2);
+	obs_properties_add_int_slider(props, "hold_ms", "Hold (ms)", 0, 3000,
+				    50);
 	obs_property_t *rows = obs_properties_add_list(
 		props, "rows", "Rows", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(rows, "2", 2);
@@ -494,6 +651,9 @@ static obs_properties_t *lc_properties(void *data)
 static void lc_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "rows", 2);
+	obs_data_set_default_int(settings, "display_mode", 0);
+	obs_data_set_default_int(settings, "latency_mode", 1);
+	obs_data_set_default_int(settings, "hold_ms", 250);
 	obs_data_set_default_bool(settings, "show_in_progress", true);
 	obs_data_set_default_bool(settings, "caption_style", true);
 }
