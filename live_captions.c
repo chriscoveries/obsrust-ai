@@ -228,9 +228,13 @@ static bool lc_commit(struct lc_filter *f, const char *w, bool speculative)
 		return false;
 	if (speculative && f->spec_n < 64)
 		strcpy(f->spec_q[f->spec_n++], w);
-	if (f->hold_ms > 0 && f->shown_ms > 0 &&
-	    lc_now_ms() - f->shown_ms < f->hold_ms && f->hold_n < 64) {
-		strcpy(f->hold_q[f->hold_n++], w);
+	/* hold only applies to single-word display (roll-up wants every
+	 * word); at most one word waits, and a newer word supersedes it so
+	 * fast speech can't build a lagging backlog */
+	if (f->mode == 1 && f->hold_ms > 0 && f->shown_ms > 0 &&
+	    lc_now_ms() - f->shown_ms < f->hold_ms) {
+		strcpy(f->hold_q[0], w);
+		f->hold_n = 1;
 		return false;
 	}
 	lc_apply_word(f, w);
