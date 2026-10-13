@@ -21,9 +21,9 @@ libstt_live.dylib: stt_live.swift
 		-target arm64-apple-macos27.0 -emit-library -O \
 		$< -o $@
 
-build/obs-live-captions: live_captions.c | build
+build/obs-live-captions: live_captions.c cea608.c cea608.h | build
 	xcrun clang $(CFLAGS) -shared -undefined dynamic_lookup \
-		-o $@ $<
+		-o $@ live_captions.c cea608.c -lm
 
 build:
 	mkdir -p build

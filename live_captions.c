@@ -9,6 +9,7 @@
 #include <obs-module.h>
 #include <media-io/audio-io.h>
 #include <util/bmem.h>
+#include <util/platform.h>
 
 #include <dlfcn.h>
 #include <pthread.h>
@@ -16,6 +17,8 @@
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
+
+#include "cea608.h"
 
 #define COLS 32
 #define MAX_ROWS 3
@@ -78,6 +81,13 @@ struct lc_filter {
 	char prev_vol[64][COLS + 1];
 	int prev_vol_n;
 	int vol_committed;
+
+	/* CEA-608 embedding: committed words are scheduled as cc_data pairs
+	 * and drip-fed to active outputs by a pacing thread */
+	bool embed608;
+	struct c608 cc;
+	pthread_t cc_thread;
+	_Atomic bool cc_running;
 };
 
 static void lc_queue_text_update(struct lc_filter *f);
@@ -295,6 +305,13 @@ static void on_word(void *opaque, const char *word, double start, double end)
 	} else {
 		dirty = lc_commit(f, word, false);
 	}
+	/* append-only 608 stream: only finalized words are embedded — a
+	 * confirmed speculation is embedded here (not at speculate time) and
+	 * a wrong speculation simply never reaches the stream (608 can't
+	 * retract). Timestamps are monotonic final word onsets. */
+	if (f->embed608 && c608_word(&f->cc, start, word) != 0)
+		blog(LOG_DEBUG, "[live-captions] 608 rejected word (unmappable "
+				"char or bad ts)");
 	/* utterance boundary: the next volatile stream starts fresh */
 	f->prev_vol_n = 0;
 	f->vol_committed = 0;
@@ -433,6 +450,38 @@ static void *lc_worker(void *opaque)
 	return NULL;
 }
 
+/* ---------------- 608 pacing thread: drip pairs to active outputs ------ */
+
+static bool lc_cc_emit(void *param, obs_output_t *output)
+{
+	if (obs_output_active(output))
+		obs_output_caption(output, param);
+	return true;
+}
+
+static void *lc_cc_worker(void *opaque)
+{
+	struct lc_filter *f = opaque;
+	/* pairs are scheduled at one pair per `step` pictures, giving the
+	 * proven 60 basic-characters/s ceiling at both 30 and 60 fps */
+	int64_t period_us = 1000000LL * f->cc.step / f->cc.fps;
+	while (atomic_load(&f->cc_running)) {
+		usleep((useconds_t)period_us);
+		uint16_t code;
+		pthread_mutex_lock(&f->mu);
+		bool ok = c608_pop(&f->cc, &code);
+		pthread_mutex_unlock(&f->mu);
+		if (!ok)
+			continue;
+		uint8_t pkt[3] = {0, (uint8_t)(code >> 8), (uint8_t)code};
+		struct obs_source_cea_708 cap = {
+			.data = pkt, .packets = 1,
+			.timestamp = os_gettime_ns()};
+		obs_enum_outputs(lc_cc_emit, &cap);
+	}
+	return NULL;
+}
+
 /* ---------------- obs filter ---------------- */
 
 static const char *lc_name(void *unused)
@@ -499,6 +548,17 @@ static void *lc_create(obs_data_t *settings, obs_source_t *source)
 		f->lines[i][0] = '\0';
 	f->col = 0;
 
+	uint32_t fps = 30;
+	{
+		struct obs_video_info ovi;
+		if (obs_get_video_info(&ovi) && ovi.fps_den &&
+		    ovi.fps_num / ovi.fps_den >= 55)
+			fps = 60;
+	}
+	c608_init(&f->cc, fps, 2);
+	atomic_store(&f->cc_running, true);
+	pthread_create(&f->cc_thread, NULL, lc_cc_worker, f);
+
 	atomic_store(&f->running, true);
 	if (f->stt_push && lc_start_engine(f)) {
 		pthread_create(&f->worker, NULL, lc_worker, f);
@@ -548,10 +608,17 @@ static void lc_update_(struct lc_filter *f, obs_data_t *settings)
 	f->mode = new_mode;
 	f->latency_mode = new_latency;
 	f->hold_ms = (int)obs_data_get_int(settings, "hold_ms");
+	uint32_t new_rows = (uint32_t)obs_data_get_int(settings, "rows");
+	if (new_rows != 2 && new_rows != 3)
+		new_rows = 2;
+	bool embed = obs_data_get_bool(settings, "embed_608");
+	/* reinit the emitter on enable and on rows change (RU2 vs RU3);
+	 * reinit under the same lock the pop/commit paths take */
+	if (embed && (!f->embed608 || new_rows != f->rows))
+		c608_init(&f->cc, f->cc.fps ? f->cc.fps : 30, (int)new_rows);
+	f->embed608 = embed;
+	f->rows = new_rows;
 	pthread_mutex_unlock(&f->mu);
-	f->rows = (uint32_t)obs_data_get_int(settings, "rows");
-	if (f->rows != 2 && f->rows != 3)
-		f->rows = 2;
 	f->show_progress = obs_data_get_bool(settings, "show_in_progress");
 	f->mono_style = obs_data_get_bool(settings, "caption_style");
 }
@@ -564,6 +631,8 @@ static void lc_update(void *data, obs_data_t *settings)
 static void lc_destroy(void *data)
 {
 	struct lc_filter *f = data;
+	atomic_store(&f->cc_running, false);
+	pthread_join(f->cc_thread, NULL);
 	atomic_store(&f->running, false);
 	if (f->engine_on) {
 		pthread_join(f->worker, NULL);
@@ -646,6 +715,8 @@ static obs_properties_t *lc_properties(void *data)
 		OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(rows, "2", 2);
 	obs_property_list_add_int(rows, "3", 3);
+	obs_properties_add_bool(props, "embed_608",
+				obs_module_text("Embed608"));
 	obs_properties_add_bool(props, "show_in_progress",
 				obs_module_text("ShowInProgress"));
 	obs_properties_add_bool(props, "caption_style",
@@ -659,6 +730,7 @@ static void lc_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "display_mode", 0);
 	obs_data_set_default_int(settings, "latency_mode", 1);
 	obs_data_set_default_int(settings, "hold_ms", 250);
+	obs_data_set_default_bool(settings, "embed_608", true);
 	obs_data_set_default_bool(settings, "show_in_progress", true);
 	obs_data_set_default_bool(settings, "caption_style", true);
 }
