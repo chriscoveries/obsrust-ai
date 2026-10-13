@@ -40,6 +40,12 @@ Builds against the libobs fork build at `~/obsrust/obs-studio`
      as an extra line under the window until it finalizes.
    - **Caption style (monospace)**: on = force a constant-width (Menlo)
      font so the 32-column grid stays aligned.
+   - **Embed captions in stream (CEA-608)**: on = also write the captions
+     into the active output as CEA-608 roll-up cc_data (field 1) through
+     `obs_output_caption()`. Only **finalized** words are embedded — the
+     stream is append-only and 608 can't retract, so speculative Fast/
+     Instant words are queued only once confirmed. Unmappable characters
+     reject the whole word rather than truncating it.
 5. Speak into the mic — words roll up the text source as they're finalized.
 
 The first launch downloads the ~600 MB on-device speech model silently if it
